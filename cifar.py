@@ -35,10 +35,15 @@ from third_party.ResNeXt_DenseNet.models.resnext import resnext29
 from third_party.WideResNet_pytorch.wideresnet import WideResNet
 
 import torch
+from torch.utils.tensorboard import SummaryWriter
+import torchvision
+from torch import nn, optim
+from scipy.stats import rankdata
 import torch.backends.cudnn as cudnn
 import torch.nn.functional as F
 from torchvision import datasets
 from torchvision import transforms
+from torchvision.models import resnet18, ResNet18_Weights, ConvNeXt_Tiny_Weights #for pretrained models
 
 parser = argparse.ArgumentParser(
     description='Trains a CIFAR Classifier',
@@ -54,7 +59,7 @@ parser.add_argument(
     '-m',
     type=str,
     default='wrn',
-    choices=['wrn', 'allconv', 'densenet', 'resnext'],
+    choices=['wrn', 'allconv', 'densenet', 'resnext', 'res18_pt', 'res18_npt','cnvnxt_pt','cnvnxt_npt'],
     help='Choose architecture.')
 # Optimization options
 parser.add_argument(
@@ -112,7 +117,7 @@ parser.add_argument(
     '--save',
     '-s',
     type=str,
-    default='./snapshots',
+    default='./checkpoints',
     help='Folder to save checkpoints.')
 parser.add_argument(
     '--resume',
@@ -132,9 +137,20 @@ parser.add_argument(
     type=int,
     default=4,
     help='Number of pre-fetching threads.')
+parser.add_argument(
+    '--optimizer',
+    type=str,
+    default = 'SGD',
+    choices=['SGD','AdamW'],
+    help='choose the optimizer to use between SGD and ADAMW.')
+parser.add_argument(
+    '--scheduler',
+    type=str,
+    default='lambda_lrs',
+    choices=['cosine_annealing_lrs','lambda_lrs'],
+    help='choose the learning ratescheduler to choose from Cosine annealing and lambda.')
 
 args = parser.parse_args()
-
 CORRUPTIONS = [
     'gaussian_noise', 'shot_noise', 'impulse_noise', 'defocus_blur',
     'glass_blur', 'motion_blur', 'zoom_blur', 'snow', 'frost', 'fog',
@@ -142,6 +158,82 @@ CORRUPTIONS = [
     'jpeg_compression'
 ]
 
+concat = lambda x: np.concatenate(x, axis=0)
+to_np = lambda x: x.data.to('cpu').numpy()
+num_classes=10
+
+def evaluate(net,loader):
+    confidence = []
+    correct = []
+
+    num_correct = 0
+    with torch.no_grad():
+        for data, target in loader:
+            data, target = data.cuda(), target.cuda()
+            output = net(2 * data - 1)
+
+            # accuracy
+            pred = output.data.max(1)[1]
+            num_correct += pred.eq(target.data).sum().item()
+
+            confidence.extend(to_np(F.softmax(output, dim=1).max(1)[0]).squeeze().tolist())
+            pred = output.data.max(1)[1]
+            correct.extend(pred.eq(target).to('cpu').numpy().squeeze().tolist())
+
+    return num_correct / len(loader.dataset), np.array(confidence), np.array(correct)
+
+args.difficulty = 1
+identity = np.asarray(range(1, num_classes+1))
+cum_sum_top5 = np.cumsum(np.asarray([0] + [1] * 5 + [0] * (num_classes-1 - 5)))
+recip = 1./identity
+
+
+def dist(sigma, mode='top5'):
+    if mode == 'top5':
+        return np.sum(np.abs(cum_sum_top5[:5] - cum_sum_top5[sigma-1][:5]))
+    elif mode == 'zipf':
+        return np.sum(np.abs(recip - recip[sigma-1])*recip)
+
+
+def ranking_dist(ranks, noise_perturbation=False, mode='top5'):
+    result = 0
+    step_size = 1 if noise_perturbation else args.difficulty
+
+    for vid_ranks in ranks:
+        result_for_vid = []
+
+        for i in range(step_size):
+            perm1 = vid_ranks[i]
+            perm1_inv = np.argsort(perm1)
+
+            for rank in vid_ranks[i::step_size][1:]:
+                perm2 = rank
+                result_for_vid.append(dist(perm2[perm1_inv], mode))
+                if not noise_perturbation:
+                    perm1 = perm2
+                    perm1_inv = np.argsort(perm1)
+
+        result += np.mean(result_for_vid) / len(ranks)
+
+    return result
+
+def flip_prob(predictions, noise_perturbation=False):
+    result = 0
+    step_size = 1 if noise_perturbation else args.difficulty
+
+    for vid_preds in predictions:
+        result_for_vid = []
+
+        for i in range(step_size):
+            prev_pred = vid_preds[i]
+
+            for pred in vid_preds[i::step_size][1:]:
+                result_for_vid.append(int(prev_pred != pred))
+                if not noise_perturbation: prev_pred = pred
+
+        result += np.mean(result_for_vid) / len(predictions)
+
+    return result
 
 def get_lr(step, total_steps, lr_max, lr_min):
   """Compute learning rate according to cosine annealing schedule."""
@@ -284,9 +376,12 @@ def test_c(net, test_data, base_path):
         corruption, test_loss, 100 - 100. * test_acc))
 
   return np.mean(corruption_accs)
-
+writer = SummaryWriter('tensorboard/'+ args.optimizer+ '_' + args.scheduler + '/' + args.model )
+#for tensorboard logging
 
 def main():
+  import gc #importing garbage collector
+  gc.collect()
   torch.manual_seed(1)
   np.random.seed(1)
 
@@ -305,6 +400,7 @@ def main():
     test_data = datasets.CIFAR10(
         './data/cifar', train=False, transform=test_transform, download=True)
     base_c_path = './data/cifar/CIFAR-10-C/'
+    base_p_path = './data/cifar/CIFAR-10-P/'
     num_classes = 10
   else:
     train_data = datasets.CIFAR100(
@@ -338,16 +434,37 @@ def main():
     net = AllConvNet(num_classes)
   elif args.model == 'resnext':
     net = resnext29(num_classes=num_classes)
-
-  optimizer = torch.optim.SGD(
-      net.parameters(),
-      args.learning_rate,
-      momentum=args.momentum,
-      weight_decay=args.decay,
-      nesterov=True)
+  elif args.model == 'res18_pt':
+    net = torchvision.models.resnet18(weights=ResNet18_Weights.DEFAULT)
+    net.fc = nn.Linear((net.fc.in_features),10)
+  elif args.model == 'res18_npt':
+    net = torchvision.models.resnet18(weights=None)
+    net.fc = nn.Linear((net.fc.in_features),10)
+  elif args.model == 'cnvnxt_pt' :
+    net = torchvision.models.convnext_tiny(weights = ConvNeXt_Tiny_Weights.DEFAULT)
+    net.classifier[2] = nn.Linear(in_features = 768, out_features=num_classes)
+  elif args.model == 'cnvnxt_npt':
+    net = torchvision.models.convnext_tiny(weights=None)
+    net.classifier[2] = nn.Linear(in_features = 768, out_features=num_classes)
+  
+  #just printing which model, optimizer, scheduler and learning rate is used for further references
+  print("This file is for " + args.model + " with " + args.optimizer + " , " + args.scheduler +' and ' + str(args.learning_rate))
+  if args.optimizer == 'SGD':
+    optimizer = torch.optim.SGD(
+       net.parameters(),
+       args.learning_rate,
+       momentum=args.momentum,
+       weight_decay=args.decay,
+       nesterov=True)
+  elif args.optimizer == 'AdamW':
+     optimizer = torch.optim.AdamW(
+        net.parameters(),
+        lr = args.learning_rate,
+        weight_decay=args.decay)
 
   # Distribute model across all visible GPUs
   net = torch.nn.DataParallel(net).cuda()
+  # net = net.cuda()
   cudnn.benchmark = True
 
   start_epoch = 0
@@ -370,14 +487,18 @@ def main():
     test_c_acc = test_c(net, test_data, base_c_path)
     print('Mean Corruption Error: {:.3f}'.format(100 - 100. * test_c_acc))
     return
-
-  scheduler = torch.optim.lr_scheduler.LambdaLR(
-      optimizer,
-      lr_lambda=lambda step: get_lr(  # pylint: disable=g-long-lambda
+  if args.scheduler == 'lambda_lrs':
+     scheduler = torch.optim.lr_scheduler.LambdaLR(
+        optimizer,
+        lr_lambda=lambda step: get_lr( # pylint: disable=g-long-lambda
           step,
           args.epochs * len(train_loader),
           1,  # lr_lambda computes multiplicative factor
           1e-6 / args.learning_rate))
+  elif args.scheduler == 'cosine_annealing_lrs':
+     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=len(train_loader)*args.epochs, verbose=False
+     )
 
   if not os.path.exists(args.save):
     os.makedirs(args.save)
@@ -395,7 +516,10 @@ def main():
     begin_time = time.time()
 
     train_loss_ema = train(net, train_loader, optimizer, scheduler)
+    writer.add_scalar("TrainLoss", train_loss_ema, epoch + 1)
     test_loss, test_acc = test(net, test_loader)
+    writer.add_scalar("TestLoss", test_loss, epoch + 1)
+    writer.add_scalar("TestAccuracy", test_acc, epoch + 1)
 
     is_best = test_acc > best_acc
     best_acc = max(test_acc, best_acc)
@@ -434,7 +558,63 @@ def main():
   with open(log_path, 'a') as f:
     f.write('%03d,%05d,%0.6f,%0.5f,%0.2f\n' %
             (args.epochs + 1, 0, 0, 0, 100 - 100 * test_c_acc))
+  
+  acc, test_confidence, test_correct = evaluate(net, test_loader)
+  print('Error', 100 - 100. * acc)
+  writer.add_scalar('Eval_accuracy', acc, epoch+1)
+  import gc #importing garbage collector
+  gc.collect()
+  c_p_dir = './data/cifar/CIFAR-10-P'
+  dummy_targets = torch.LongTensor(np.random.randint(0, num_classes, (10000,)))
+  flip_list = []
+  zipf_list = []
+
+  for p in ['gaussian_noise', 'shot_noise', 'motion_blur', 'zoom_blur',
+            'spatter', 'brightness', 'translate', 'rotate', 'tilt', 'scale',
+            'speckle_noise', 'gaussian_blur', 'snow', 'shear']:
+    dataset = torch.from_numpy(np.float32(np.load(os.path.join('./data/cifar/CIFAR-10-P/' + p + '.npy')).transpose((0,1,4,2,3))))/255.
+
+    ood_data = torch.utils.data.TensorDataset(dataset, dummy_targets)
+
+    loader = torch.utils.data.DataLoader(
+            dataset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers, pin_memory=True)
+
+    predictions, ranks = [], []
+
+    with torch.no_grad():
+
+        for data in loader:
+            num_vids = data.size(0)
+            data = data.view(-1,3,32,32).cuda()
+
+            output = net(data * 2 - 1)
+
+            for vid in output.view(num_vids, -1, num_classes):
+                predictions.append(vid.argmax(1).to('cpu').numpy())
+                ranks.append([np.uint16(rankdata(-frame, method='ordinal')) for frame in vid.to('cpu').numpy()])
+
+        ranks = np.asarray(ranks)
+
+        print('\nComputing Metrics for', p,)
+
+        current_flip = flip_prob(predictions, True if 'noise' in p else False)
+        current_zipf = ranking_dist(ranks, True if 'noise' in p else False, mode='zipf')
+        flip_list.append(current_flip)
+        zipf_list.append(current_zipf)
+
+        print('\n' + p, 'Flipping Prob')
+        print(current_flip)
+        print('Top5 Distance\t{:.5f}'.format(ranking_dist(ranks, True if 'noise' in p else False, mode='top5')))
+        print('Zipf Distance\t{:.5f}'.format(current_zipf))
+
+  print(flip_list)
+  print('\nMean Flipping Prob\t{:.5f}'.format(np.mean(flip_list)))
+  print('Mean Zipf Distance\t{:.5f}'.format(np.mean(zipf_list)))
+  for perturbation, flip_probability, rank_disti in zip(p, flip_list, zipf_list):
+    writer.add_scalar(f'Flipping probability/{perturbation}', flip_probability, epoch+1)
+    writer.add_scalar(f'Ranking distance/{perturbation}', rank_disti, epoch+1)
 
 
 if __name__ == '__main__':
   main()
+  writer.close()
